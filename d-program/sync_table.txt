@@ -1,0 +1,434 @@
+# Tutorial: Sinkronisasi Tabel yang Tahan Laptop Mati
+
+Saya asumsikan setup umum dulu, nanti tinggal Anda sesuaikan:
+
+- **Host 241** = server Linux, database **PostgreSQL**, hidup 24/7, sumber data terbaru.
+- **Laptop** = mesin yang menjalankan script sync (bisa Windows/Linux), sering mati.
+- **Target** = database lain (misal PostgreSQL lokal, MySQL, atau DB di server lain).
+- **Script** = Python.
+
+Kalau DB Anda MySQL atau SQL Server, tinggal ganti query-nya, alurnya sama.
+
+---
+
+## Bagian 0 — Prasyarat
+
+Pastikan:
+
+1. Laptop bisa akses host 241 (ping / SSH / koneksi DB).
+2. Host 241 bisa menyimpan tabel kontrol (kita akan buat).
+3. Python 3.8+ terinstall di laptop.
+4. Ada tabel sumber di host 241 yang punya kolom:
+   - primary key (`id`),
+   - kolom waktu update (`updated_at`) atau auto increment.
+
+Kalau tidak ada `updated_at`, tambahkan:
+```sql
+ALTER TABLE orders ADD COLUMN updated_at TIMESTAMP DEFAULT NOW();
+
+CREATE OR REPLACE FUNCTION trg_set_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+  NEW.updated_at = NOW();
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER set_updated_at
+BEFORE UPDATE ON orders
+FOR EACH ROW EXECUTE FUNCTION trg_set_updated_at();
+```
+
+---
+
+## Bagian 1 — Siapkan Tabel Kontrol di Host 241
+
+Ini kunci utama: **state sync disimpan di host 241**, bukan di laptop.
+
+Jalankan di host 241:
+
+```sql
+CREATE TABLE sync_state (
+  table_name   VARCHAR(100) PRIMARY KEY,
+  last_sync_ts TIMESTAMP NOT NULL DEFAULT '1970-01-01',
+  last_sync_id BIGINT    NOT NULL DEFAULT 0,
+  updated_at   TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+INSERT INTO sync_state (table_name) VALUES ('orders');
+```
+
+Cek:
+```sql
+SELECT * FROM sync_state;
+```
+
+---
+
+## Bagian 2 — Siapkan Tabel Target
+
+Di database target (bisa di laptop atau server lain), buat tabel yang sama strukturnya. Minimal:
+
+```sql
+CREATE TABLE orders (
+  id          BIGINT PRIMARY KEY,
+  name        VARCHAR(255),
+  amount      NUMERIC(18,2),
+  updated_at  TIMESTAMP
+);
+
+CREATE INDEX idx_orders_updated_at ON orders (updated_at);
+```
+
+Pastikan `id` sebagai primary key supaya upsert bisa jalan.
+
+---
+
+## Bagian 3 — Buat Script Sync
+
+Buat folder kerja, misal `sync-app`, lalu install dependency:
+
+```bash
+pip install psycopg2-binary python-dotenv
+```
+
+Buat file `.env`:
+```
+SRC_HOST=192.168.1.241
+SRC_PORT=5432
+SRC_DB=production
+SRC_USER=sync_user
+SRC_PASS=rahasia
+
+DST_HOST=localhost
+DST_PORT=5432
+DST_DB=mirror
+DST_USER=sync_user
+DST_PASS=rahasia
+```
+
+Buat `sync.py`:
+
+```python
+import os
+import time
+import logging
+from datetime import datetime
+import psycopg2
+from psycopg2.extras import execute_values
+from dotenv import load_dotenv
+
+load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("sync.log"),
+        logging.StreamHandler()
+    ]
+)
+log = logging.getLogger(__name__)
+
+BATCH_SIZE = 500
+TABLE = "orders"
+
+
+def connect(prefix):
+    return psycopg2.connect(
+        host=os.getenv(f"{prefix}_HOST"),
+        port=os.getenv(f"{prefix}_PORT"),
+        dbname=os.getenv(f"{prefix}_DB"),
+        user=os.getenv(f"{prefix}_USER"),
+        password=os.getenv(f"{prefix}_PASS"),
+    )
+
+
+def get_state(src_conn):
+    with src_conn.cursor() as cur:
+        cur.execute(
+            "SELECT last_sync_ts, last_sync_id FROM sync_state WHERE table_name = %s",
+            (TABLE,),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise RuntimeError(f"sync_state untuk {TABLE} belum ada")
+        return row[0], row[1]
+
+
+def save_state(src_conn, ts, last_id):
+    """Simpan watermark ke host 241. Commit langsung supaya tidak hilang kalau laptop mati."""
+    with src_conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE sync_state
+            SET last_sync_ts = %s,
+                last_sync_id = %s,
+                updated_at   = NOW()
+            WHERE table_name = %s
+            """,
+            (ts, last_id, TABLE),
+        )
+    src_conn.commit()
+
+
+def fetch_batch(src_conn, last_ts, last_id, limit):
+    """Ambil batch berikutnya. Pakai (updated_at, id) supaya tidak ada yang terlewat
+    saat timestamp sama."""
+    with src_conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, name, amount, updated_at
+            FROM orders
+            WHERE (updated_at, id) > (%s, %s)
+            ORDER BY updated_at, id
+            LIMIT %s
+            """,
+            (last_ts, last_id, limit),
+        )
+        return cur.fetchall()
+
+
+def upsert_batch(dst_conn, rows):
+    """Upsert ke target. Idempotent: boleh dijalankan ulang tanpa duplikat."""
+    if not rows:
+        return
+    with dst_conn.cursor() as cur:
+        execute_values(
+            cur,
+            """
+            INSERT INTO orders (id, name, amount, updated_at)
+            VALUES %s
+            ON CONFLICT (id) DO UPDATE SET
+              name       = EXCLUDED.name,
+              amount     = EXCLUDED.amount,
+              updated_at = EXCLUDED.updated_at
+            WHERE orders.updated_at < EXCLUDED.updated_at
+            """,
+            rows,
+            page_size=BATCH_SIZE,
+        )
+    dst_conn.commit()
+
+
+def sync_once():
+    src = connect("SRC")
+    dst = connect("DST")
+    try:
+        last_ts, last_id = get_state(src)
+        log.info(f"Mulai sync dari watermark ts={last_ts}, id={last_id}")
+
+        total = 0
+        while True:
+            rows = fetch_batch(src, last_ts, last_id, BATCH_SIZE)
+            if not rows:
+                break
+
+            upsert_batch(dst, rows)
+            total += len(rows)
+
+            # Ambil watermark baru dari baris terakhir batch
+            last_row = rows[-1]
+            last_ts  = last_row[3]  # updated_at
+            last_id  = last_row[0]  # id
+
+            # Simpan watermark KE HOST 241 setiap batch
+            save_state(src, last_ts, last_id)
+            log.info(f"Batch {len(rows)} baris selesai. Watermark -> {last_ts} / {last_id}")
+
+        log.info(f"Sync selesai. Total {total} baris.")
+    finally:
+        src.close()
+        dst.close()
+
+
+def run_forever(interval=5):
+    """Loop tiap 5 detik. Kalau laptop mati, tinggal jalankan ulang."""
+    log.info("Sync service start.")
+    while True:
+        try:
+            sync_once()
+        except Exception as e:
+            log.exception(f"Sync gagal: {e}")
+        time.sleep(interval)
+
+
+if __name__ == "__main__":
+    run_forever(interval=5)
+```
+
+Poin penting yang sudah tertanam di script:
+
+1. **Watermark disimpan di host 241** (`save_state`), bukan di laptop.
+2. **Disimpan per batch**, jadi kalau laptop mati di tengah, batch terakhir diulang — aman karena upsert idempotent.
+3. **Upsert pakai `ON CONFLICT`**, jadi data yang sudah ada tidak diduplikasi.
+4. **Loop `while True`** — kalau laptop mati, tinggal jalankan ulang, langsung catch-up dari watermark terakhir.
+
+---
+
+## Bagian 4 — Jalankan Manual Dulu
+
+```bash
+python sync.py
+```
+
+Cek log:
+```
+2025-01-01 10:00:00 [INFO] Mulai sync dari watermark ts=1970-01-01, id=0
+2025-01-01 10:00:00 [INFO] Batch 500 baris selesai. Watermark -> 2025-01-01 09:59:55 / 500
+2025-01-01 10:00:00 [INFO] Sync selesai. Total 500 baris.
+```
+
+Uji:
+- Tambah data di host 241, tunggu <5 detik, cek di target.
+- Matikan laptop (Ctrl+C), tambah data lagi di host 241, hidupkan laptop, jalankan script lagi. Data yang tertinggal harus ter-sync.
+
+---
+
+## Bagian 5 — Jalankan Otomatis Saat Laptop Hidup
+
+### Linux (systemd user service)
+
+Buat `~/.config/systemd/user/sync.service`:
+```ini
+[Unit]
+Description=Sync tabel dari host 241
+After=network-online.target
+
+[Service]
+WorkingDirectory=/home/user/sync-app
+ExecStart=/usr/bin/python3 /home/user/sync-app/sync.py
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/user/sync-app/sync.log
+StandardError=append:/home/user/sync-app/sync.log
+
+[Install]
+WantedBy=default.target
+```
+
+Aktifkan:
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now sync.service
+systemctl --user status sync.service
+```
+
+### Windows (Task Scheduler)
+
+1. Buka **Task Scheduler** → **Create Task**.
+2. Tab **General**: centang "Run whether user is logged on or not".
+3. Tab **Triggers**: New → **At startup** (dan tambahkan **At log on** untuk jaga-jaga).
+4. Tab **Actions**: Start a program → `python.exe` dengan argument `C:\sync-app\sync.py`.
+5. Tab **Settings**: centang "If the task fails, restart every 1 minute".
+6. Save, masukkan password user.
+
+Dengan begini, tiap laptop hidup, service langsung jalan dan catch-up otomatis.
+
+---
+
+## Bagian 6 — Verifikasi dan Monitoring
+
+### Cek watermark
+```sql
+SELECT * FROM sync_state WHERE table_name = 'orders';
+```
+
+### Cek lag
+```sql
+SELECT
+  (SELECT MAX(updated_at) FROM orders) AS max_src,
+  last_sync_ts AS last_synced,
+  (SELECT MAX(updated_at) FROM orders) - last_sync_ts AS lag
+FROM sync_state WHERE table_name = 'orders';
+```
+
+Kalau `lag` makin besar, berarti ada masalah.
+
+### Alert sederhana
+
+Tambahkan di script, kirim notifikasi kalau lag > 60 detik:
+```python
+def check_lag(src_conn, threshold_sec=60):
+    with src_conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT EXTRACT(EPOCH FROM (MAX(updated_at) - (
+              SELECT last_sync_ts FROM sync_state WHERE table_name = %s
+            )))
+            FROM orders
+            """,
+            (TABLE,),
+        )
+        lag = cur.fetchone()[0] or 0
+        if lag > threshold_sec:
+            log.warning(f"LAG tinggi: {lag:.0f} detik")
+```
+
+---
+
+## Bagian 7 — Handle Delete (opsional)
+
+Kalau data di host 241 bisa dihapus, ada 3 pilihan:
+
+**Opsi A — Soft delete** (paling simpel):
+```sql
+ALTER TABLE orders ADD COLUMN deleted_at TIMESTAMP;
+```
+Sync seperti biasa, kolom `deleted_at` ikut tersalin.
+
+**Opsi B — Tombstone table**:
+```sql
+CREATE TABLE orders_tombstone (
+  id BIGINT PRIMARY KEY,
+  deleted_at TIMESTAMP DEFAULT NOW()
+);
+```
+Buat trigger di host 241 yang insert ke sini setiap ada DELETE. Script sync baca tabel ini, hapus di target.
+
+**Opsi C — Full compare periodik** (untuk tabel kecil):
+Sekali sehari, bandingkan ID di sumber vs target, hapus yang tidak ada di sumber.
+
+---
+
+## Bagian 8 — Upgrade: Pindahkan Sync ke Host 241
+
+Ini langkah pamungkas supaya laptop tidak jadi titik lemah. Setelah script stabil:
+
+1. Copy `sync.py` dan `.env` ke host 241.
+2. Buat systemd service (system, bukan user):
+   ```ini
+   [Unit]
+   Description=Sync service
+   After=network.target
+
+   [Service]
+   WorkingDirectory=/opt/sync-app
+   ExecStart=/usr/bin/python3 /opt/sync-app/sync.py
+   Restart=always
+   RestartSec=5
+
+   [Install]
+   WantedBy=multi-user.target
+   ```
+3. `sudo systemctl enable --now sync.service`.
+
+Setelah ini, laptop boleh mati kapan pun, sync tetap jalan.
+
+---
+
+## Checklist Akhir
+
+- [ ] Tabel sumber punya `updated_at` dan primary key.
+- [ ] Tabel `sync_state` ada di **host 241**, bukan laptop.
+- [ ] Script menyimpan watermark **per batch**.
+- [ ] Upsert pakai `ON CONFLICT` / `MERGE`.
+- [ ] Query pakai `(updated_at, id) > (...)` untuk hindari baris terlewat.
+- [ ] Service auto-start saat laptop hidup.
+- [ ] Log tersimpan di file, bukan hanya console.
+- [ ] Ada cara cek lag.
+- [ ] (Nanti) Pindahkan service ke host 241.
+
+---
+
+Kalau Anda kasih tahu **DB target** dan **OS laptop** yang dipakai, saya bisa sesuaikan script dan langkah instalasinya (misal MySQL target, atau Windows + Task Scheduler lengkap dengan screenshot alur).
