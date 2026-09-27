@@ -1,0 +1,86 @@
+ALTER TABLE karyawan
+    CHANGE `id` `id` INT NOT NULL AUTO_INCREMENT,
+
+    CHANGE `foto` `photo` VARCHAR(255) NULL,
+
+    CHANGE `nik` `national_id` VARCHAR(20) NOT NULL,
+
+    CHANGE `nama` `name` VARCHAR(100) NOT NULL,
+
+    CHANGE `tempat_lahir` `place_of_birth` VARCHAR(50) NULL,
+
+    CHANGE `tanggal_lahir` `date_of_birth` DATE NULL,
+
+    CHANGE `jenis_kelamin` `gender`
+        ENUM('Laki-laki', 'Perempuan') NULL,
+
+    CHANGE `golongan_darah` `blood_type`
+        ENUM('A', 'B', 'AB', 'O') NULL,
+
+    CHANGE `agama` `religion` VARCHAR(20) NULL,
+
+    CHANGE `status_perkawinan` `marital_status`
+        ENUM('Belum Kawin', 'Kawin', 'Cerai Hidup', 'Cerai Mati') NULL,
+
+    CHANGE `jumlah_anak` `number_of_children` INT NULL DEFAULT 0,
+
+    CHANGE `alamat_ktp` `ktp_address` TEXT NULL,
+
+    CHANGE `alamat_domisili` `residential_address` TEXT NULL,
+
+    CHANGE `no_telepon` `phone_number` VARCHAR(15) NULL,
+
+    CHANGE `email` `email` VARCHAR(100) NULL,
+
+    CHANGE `kontak_darurat` `emergency_contact` VARCHAR(15) NULL,
+
+    CHANGE `pendidikan_terakhir` `last_education` VARCHAR(50) NULL,
+
+    CHANGE `institusi_pendidikan` `educational_institution` VARCHAR(100) NULL,
+
+    CHANGE `tahun_lulus` `graduation_year` YEAR NULL,
+
+    CHANGE `jurusan` `major` VARCHAR(50) NULL,
+
+    CHANGE `nip` `employee_number` VARCHAR(30) NULL,
+
+    CHANGE `plant` `plant` VARCHAR(20) NULL,
+
+    CHANGE `bagian` `section` VARCHAR(20) NULL,
+
+    CHANGE `line` `production_line` VARCHAR(20) NULL,
+
+    CHANGE `status_line` `line_status` VARCHAR(20) NULL,
+
+    CHANGE `jabatan` `position` VARCHAR(50) NULL,
+
+    CHANGE `departemen` `department` VARCHAR(50) NULL,
+
+    CHANGE `tanggal_masuk` `join_date` DATE NULL,
+
+    CHANGE `status_karyawan` `employment_status`
+        ENUM('Tetap', 'Kontrak', 'Magang', 'Resign')
+        NULL DEFAULT 'Kontrak',
+
+    CHANGE `gaji_pokok` `basic_salary` DECIMAL(10,2) NULL,
+
+    CHANGE `tunjangan` `allowance` DECIMAL(10,2) NULL DEFAULT 0.00,
+
+    CHANGE `no_rekening` `bank_account_number` VARCHAR(30) NULL,
+
+    CHANGE `bank` `bank_name` VARCHAR(30) NULL,
+
+    CHANGE `bpjs_kesehatan` `health_insurance_number` VARCHAR(20) NULL,
+
+    CHANGE `bpjs_ketenagakerjaan` `employment_insurance_number` VARCHAR(20) NULL,
+
+    CHANGE `riwayat_sakit` `medical_history` TEXT NULL,
+
+    CHANGE `catatan_lain` `other_notes` TEXT NULL,
+
+    CHANGE `created_at` `created_at`
+        TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CHANGE `updated_at` `updated_at`
+        TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP
+        ON UPDATE CURRENT_TIMESTAMP;
